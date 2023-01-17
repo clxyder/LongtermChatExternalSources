@@ -1,52 +1,50 @@
 import os
-import openai
-import json
-import numpy as np
-from numpy.linalg import norm
 import re
-from time import time,sleep
+from configparser import ConfigParser
+from typing import List
+from time import time, sleep
 from uuid import uuid4
 
+import openai
 
-def open_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return infile.read()
+from constants import (
+    PROMPT_NOTES_TEMPLATE,
+    PROMPT_RESPONSE_TEMPLATE,
+    RAVEN_NAME,
+    USER_NAME,
+    CONFIG_DEFAULT_KEY,
+    CONFIG_OPENAI_API_KEY,
+    INPUT_KEY,
+    NOTES_KEY,
+    CONVERSATION_KEY,
+    CHAT_LOG_DIR,
+)
+
+from utils import (
+    save_file,
+    load_json,
+    log_json_message,
+    cosine_similarity,
+)
+
+config = ConfigParser()
+config.read("config.ini")
+openai.api_key = config[CONFIG_DEFAULT_KEY][CONFIG_OPENAI_API_KEY]
 
 
-def save_file(filepath, content):
-    with open(filepath, 'w', encoding='utf-8') as outfile:
-        outfile.write(content)
-
-
-def load_json(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return json.load(infile)
-
-
-def save_json(filepath, payload):
-    with open(filepath, 'w', encoding='utf-8') as outfile:
-        json.dump(payload, outfile, ensure_ascii=False, sort_keys=True, indent=2)
-
-
-def gpt3_embedding(content, engine='text-embedding-ada-002'):
-    content = content.encode(encoding='ASCII',errors='ignore').decode()
-    response = openai.Embedding.create(input=content,engine=engine)
+def gpt3_embedding(content: str, engine='text-embedding-ada-002') -> List[float]:
+    content = content.encode(encoding='ASCII', errors='ignore').decode()
+    response = openai.Embedding.create(input=content, engine=engine)
     vector = response['data'][0]['embedding']  # this is a normal list
     return vector
 
-
-def similarity(v1, v2):
-    # based upon https://stackoverflow.com/questions/18424228/cosine-similarity-between-2-number-lists
-    return np.dot(v1, v2)/(norm(v1)*norm(v2))  # return cosine similarity
-
-
-def fetch_memories(vector, logs, count):
+def fetch_memories(vector: List[float], logs: List[dict], count: int) -> List[dict]:
     scores = list()
     for i in logs:
         if vector == i['vector']:
             # skip this one because it is the same message
             continue
-        score = similarity(i['vector'], vector)
+        score = cosine_similarity(i['vector'], vector)
         i['score'] = score
         scores.append(i)
     ordered = sorted(scores, key=lambda d: d['score'], reverse=True)
@@ -58,30 +56,30 @@ def fetch_memories(vector, logs, count):
         return ordered
 
 
-def load_convo():
-    files = os.listdir('chat_logs')
+def load_convo() -> List[dict]:
+    files = os.listdir(CHAT_LOG_DIR)
     files = [i for i in files if '.json' in i]  # filter out any non-JSON files
     result = list()
     for file in files:
-        data = load_json('chat_logs/%s' % file)
+        data = load_json(os.path.join(CHAT_LOG_DIR, file))
         result.append(data)
     ordered = sorted(result, key=lambda d: d['time'], reverse=False)  # sort them all chronologically
-    return result
+    return ordered
 
 
-def summarize_memories(memories):  # summarize a block of memories into one payload
+def summarize_memories(memories: List[dict]) -> List[str]:  # summarize a block of memories into one payload
     memories = sorted(memories, key=lambda d: d['time'], reverse=False)  # sort them chronologically
     block = ''
     for mem in memories:
         block += '%s: %s\n\n' % (mem['speaker'], mem['message'])
     block = block.strip()
-    prompt = open_file('prompt_notes.txt').replace('<<INPUT>>', block)
+    prompt = PROMPT_NOTES_TEMPLATE.replace(INPUT_KEY, block)
     # TODO - do this in the background over time to handle huge amounts of memories
     notes = gpt3_completion(prompt)
     return notes
 
 
-def get_last_messages(conversation, limit):
+def get_last_messages(conversation: List[dict], limit: int) -> str:
     try:
         short = conversation[-limit:]
     except:
@@ -93,10 +91,10 @@ def get_last_messages(conversation, limit):
     return output
 
 
-def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=400, freq_pen=0.0, pres_pen=0.0, stop=['USER:', 'RAVEN:']):
+def gpt3_completion(prompt:str, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=400, freq_pen=0.0, pres_pen=0.0, stop=['USER:', 'RAVEN:']) -> str:
     max_retry = 5
     retry = 0
-    prompt = prompt.encode(encoding='ASCII',errors='ignore').decode()
+    prompt = prompt.encode(encoding='ASCII', errors='ignore').decode()
     while True:
         try:
             response = openai.Completion.create(
@@ -124,28 +122,57 @@ def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, toke
             sleep(1)
 
 
+def format_log_message(speaker: str, vector, message: str) -> dict:
+    return {
+        'speaker': speaker,
+        'time': time(),
+        'vector': vector, # TODO this can be compressed into a hash
+        'message': message,
+        'uuid': str(uuid4())
+    }
+
+
+def process_user_input(user_input: str) -> List[float]:
+    #### vectorize and save user input
+    input_embedding = gpt3_embedding(user_input, engine='text-embedding-ada-002')
+    info = format_log_message(USER_NAME, input_embedding, user_input)
+    log_json_message(info, USER_NAME, CHAT_LOG_DIR)
+    return input_embedding
+
+
+def generate_corpus(user_input_vector: List[float]) -> str:
+    #### load conversation
+    conversation = load_convo()
+    #### compose corpus (fetch memories, etc)
+    memories = fetch_memories(user_input_vector, conversation, 10)  # pull episodic memories
+    # TODO - fetch declarative memories (facts, wikis, KB, company data, internet, etc)
+    notes = summarize_memories(memories)
+    recent = get_last_messages(conversation, 4)
+    prompt: str = PROMPT_RESPONSE_TEMPLATE.replace(NOTES_KEY, notes)
+    return prompt.replace(CONVERSATION_KEY, recent)
+
+
+def process_gpt_output(prompt: str) -> str:
+    output = gpt3_completion(prompt)
+    output_embedding = gpt3_embedding(output, engine='text-embedding-ada-002')
+    info = format_log_message(RAVEN_NAME, output_embedding, output)
+    log_json_message(info, RAVEN_NAME, CHAT_LOG_DIR)
+    return output
+
+
 if __name__ == '__main__':
-    openai.api_key = open_file('openaiapikey.txt')
     while True:
-        #### get user input, save it, vectorize it, etc
-        a = input('\n\nUSER: ')
-        vector = gpt3_embedding(a)
-        info = {'speaker': 'USER', 'time': time(), 'vector': vector, 'message': a, 'uuid': str(uuid4())}
-        filename = 'log_%s_USER.json' % time()
-        save_json('chat_logs/%s' % filename, info)
-        #### load conversation
-        conversation = load_convo()
-        #### compose corpus (fetch memories, etc)
-        memories = fetch_memories(vector, conversation, 10)  # pull episodic memories
-        # TODO - fetch declarative memories (facts, wikis, KB, company data, internet, etc)
-        notes = summarize_memories(memories)
-        recent = get_last_messages(conversation, 4)
-        prompt = open_file('prompt_response.txt').replace('<<NOTES>>', notes).replace('<<CONVERSATION>>', recent)
+        #### get user input
+        user_input = input(f'\n\n{USER_NAME}: ')
+
+        #### vectorize and save user input
+        user_input_vector = process_user_input(user_input)
+
+        #### Generate corpus prompt
+        prompt = generate_corpus(user_input_vector)
+
         #### generate response, vectorize, save, etc
-        output = gpt3_completion(prompt)
-        vector = gpt3_embedding(output)
-        info = {'speaker': 'RAVEN', 'time': time(), 'vector': vector, 'message': output, 'uuid': str(uuid4())}
-        filename = 'log_%s_RAVEN.json' % time()
-        save_json('chat_logs/%s' % filename, info)
+        output = process_gpt_output(prompt)
+
         #### print output
-        print('\n\nRAVEN: %s' % output) 
+        print(f'\n\n{RAVEN_NAME}: {output}')
